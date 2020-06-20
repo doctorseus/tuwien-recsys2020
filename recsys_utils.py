@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from multiprocessing import Pool, cpu_count, Manager
 
 from sklearn.model_selection import KFold
 from sklearn.model_selection import TimeSeriesSplit
@@ -37,7 +38,10 @@ def recsys_load_training_df(file_path):
     return df
 
 def recsys_cv_split_single(df):
-    df_train, df_test = train_test_split(df, test_size=0.20, random_state=42)
+    user_counts = df['engaging_user_id'].value_counts()
+    df_filtered = df[~df['engaging_user_id'].isin(user_counts[user_counts < 2].index)]
+    
+    df_train, df_test = train_test_split(df_filtered, stratify=df_filtered['engaging_user_id'], test_size=0.20, random_state=42)
     return [(df_train, df_test)]
 
 def recsys_cv_split_tweetid(df):
@@ -78,6 +82,17 @@ def recsys_cv_split_time(df):
         dev_df = df_sorted.loc[dev_idx,:]
         yield train_df, dev_df
 
+def recsys_cv_split_time_single(df):
+    cv = TimeSeriesSplit(n_splits=cv_split_folds)
+    df_sorted = df.sort_values(by=['tweet_timestamp'])
+    time_splits = list(cv.split(df_sorted))
+
+    train_idx, dev_idx = time_splits[len(time_splits) - 1]
+    train_df = df_sorted.loc[train_idx,:]
+    dev_df = df_sorted.loc[dev_idx,:]
+    return [(train_df, dev_df)]
+    
+
 def compute_prauc(pred, gt):
     prec, recall, thresh = precision_recall_curve(gt, pred)
     prauc = auc(recall, prec)
@@ -96,41 +111,63 @@ def compute_rce(pred, gt):
 
 def get_test_gt(df_test):
     return (~df_test['reply_timestamp'].isna()).astype(int).to_numpy(), (~df_test['retweet_timestamp'].isna()).astype(int).to_numpy(), (~df_test['retweet_with_comment_timestamp'].isna()).astype(int).to_numpy(), (~df_test['like_timestamp'].isna()).astype(int).to_numpy()
-  
-def recsys_evaluate(df_data, recommender_train_predict_cb, type='all'):
-    df_results = pd.DataFrame()
 
+def recsys_evaluation_worker(result_queue, split_type, recommender_train_predict_cb, df_rain, df_test):
+    try:
+        pred_reply, pred_retweet, pred_retweet_wc, pred_like = zip(*list(recommender_train_predict_cb(df_rain, df_test)))
+
+        gt_reply, gt_retweet, gt_retweet_wc, gt_like = get_test_gt(df_test)
+        result_queue.put({
+            'split_type': split_type,
+            'reply (PRAUC)': compute_prauc(pred_reply, gt_reply),
+            'reply (CTR)': calculate_ctr(gt_reply),
+            'reply (RCE)': compute_rce(pred_reply, gt_reply),
+
+            'retweet (PRAUC)': compute_prauc(pred_retweet, gt_retweet),
+            'retweet (CTR)': calculate_ctr(gt_retweet),
+            'retweet (RCE)': compute_rce(pred_retweet, gt_retweet),
+
+            'retweet_wc (PRAUC)': compute_prauc(pred_retweet_wc, gt_retweet_wc),
+            'retweet_wc (CTR)': calculate_ctr(gt_retweet_wc),
+            'retweet_wc (RCE)': compute_rce(pred_retweet_wc, gt_retweet_wc),
+
+            'like (PRAUC)': compute_prauc(pred_like, gt_like),
+            'like (CTR)': calculate_ctr(gt_like),
+            'like (RCE)': compute_rce(pred_like, gt_like),
+        })
+    except Exception as e:
+        print('Evaluation failed: %s' % e)
+
+def recsys_evaluate(df_data, recommender_train_predict_cb, type='all', parallel=True):
     print('Run RecSys recommender evaluation:')
+    cpus = cpu_count() if parallel else 1
+    print(f'CPUs: {cpus}')
+
+    pool = Pool(int(cpus))
+    m = Manager()
+    result_queue = m.Queue()
     
-    for split_type, split_func in zip(['single_random', 'tweetid', 'userid', 'time'], [recsys_cv_split_single, recsys_cv_split_tweetid, recsys_cv_split_userid, recsys_cv_split_time]):
-        if type == 'all' or type == split_type or split_type in type:
+    for split_type, split_func in zip(['single_random', 'tweetid', 'userid', 'time', 'single_time'], [recsys_cv_split_single, recsys_cv_split_tweetid, recsys_cv_split_userid, recsys_cv_split_time, recsys_cv_split_time_single]):
+        if type == 'all' or type == split_type or (isinstance(type, list) and split_type in type):
             print('> cv-split (%s)' % split_type)
-
-            results_prauc = []
             for df_train, df_test in split_func(df_data):
-                gt_reply, gt_retweet, gt_retweet_wc, gt_like = get_test_gt(df_test)
+                pool.apply_async(recsys_evaluation_worker, (result_queue, split_type, recommender_train_predict_cb, df_train.reset_index(drop=True), df_test.reset_index(drop=True)))
 
-                pred_reply, pred_retweet, pred_retweet_wc, pred_like = zip(*list(recommender_train_predict_cb(df_train, df_test)))
+    pool.close()
+    pool.join()
 
+    # Collect results
+    df_results = pd.DataFrame()
+    while not result_queue.empty():
+        result = result_queue.get()
+        df_results = df_results.append(result, ignore_index=True)
 
-                prauc_reply = compute_prauc(pred_reply, gt_reply)
-                prauc_retweet = compute_prauc(pred_retweet, gt_retweet)
-                prauc_retweet_wc = compute_prauc(pred_retweet_wc, gt_retweet_wc)
-                prauc_like = compute_prauc(pred_like, gt_like)
+    df_results_mean = df_results.groupby('split_type').mean()
+    df_results_mean['agg'] = 'mean'
 
-                results_prauc.append([prauc_reply, prauc_retweet, prauc_retweet_wc, prauc_like])
+    df_results_min = df_results.groupby('split_type').min()
+    df_results_min['agg'] = 'min'
 
-                print('.', end='')
-            print()
-
-            results_prauc_mean = np.array(results_prauc).mean(axis=0)
-            df_results = df_results.append({
-                'split_type': split_type,
-                'PRAUC(reply)': results_prauc_mean[0],
-                'PRAUC(retweet)': results_prauc_mean[1],
-                'PRAUC(retweet_wc)': results_prauc_mean[2],
-                'PRAUC(like)': results_prauc_mean[3]
-            }, ignore_index=True)
-
-    df_results = df_results.set_index('split_type')
-    return df_results
+    df_results_max = df_results.groupby('split_type').max()
+    df_results_max['agg'] = 'max'
+    return pd.concat([df_results_mean, df_results_min, df_results_max]).set_index(['agg'], append=True).sort_index()
